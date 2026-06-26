@@ -59,6 +59,17 @@ class DispatchLog(Base):
     dispatched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class ReporterProfile(Base):
+    """Credibility state for each phone/user ID. Created on first false-alarm."""
+    __tablename__ = "reporter_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    phone_or_user_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    credibility_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    false_alarm_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_penalized_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 # ── In-memory config ──────────────────────────────────────────────────────────
 
 KNOWN_HIGH_RISK_AREAS: list[str] = [
@@ -146,6 +157,7 @@ async def compute_score(incident: Incident, db: AsyncSession) -> dict:
         "verified_reporter": 0,
         "cluster_match": 0,
         "authority_confirmed": 0,
+        "reporter_credibility": 0,   # penalty for serial false alarmers
         "total": 0,
     }
 
@@ -217,9 +229,25 @@ async def compute_score(incident: Incident, db: AsyncSession) -> dict:
     if incident.is_authority_confirmed:
         bd["authority_confirmed"] = 20
 
-    # ── Step 4: cap at 100 ────────────────────────────────────────────────────
+    # ── Step 4: reporter credibility penalty ──────────────────────────────────
+    profile = (
+        await db.execute(
+            select(ReporterProfile).where(
+                ReporterProfile.phone_or_user_id == incident.phone_or_user_id
+            )
+        )
+    ).scalar_one_or_none()
+
+    if profile is not None:
+        w = profile.credibility_weight
+        if w < 0.5:
+            bd["reporter_credibility"] = -15  # chronic false alarmer
+        elif w < 0.8:
+            bd["reporter_credibility"] = -5   # below-average credibility
+
+    # ── Step 5: cap at 100, floor at 0 ───────────────────────────────────────
     raw = sum(v for k, v in bd.items() if k != "total")
-    bd["total"] = min(raw, 100)
+    bd["total"] = max(0, min(raw, 100))
 
     return bd
 
@@ -276,6 +304,34 @@ async def run_dispatch(incident: Incident, breakdown: dict, db: AsyncSession) ->
     return action
 
 
+# ── Community broadcast ───────────────────────────────────────────────────────
+
+async def _broadcast_alert(incident: Incident, db: AsyncSession) -> None:
+    """Print + log a community notification for a Tier 3 incident."""
+    print(
+        f"\n╔═ 📢  COMMUNITY BROADCAST [TIER 3] ══════════════════════"
+        f"\n║  Ref      : {incident.ref}"
+        f"\n║  Type     : {incident.incident_type}"
+        f"\n║  Location : {incident.location}"
+        f"\n║  Score    : {incident.confidence_score}"
+        f"\n║  ► Notifying all registered community members."
+        f"\n║  [TODO] FCM push notification → registered devices"
+        f"\n║  [TODO] Africa's Talking SMS blast → community contacts"
+        f"\n╚════════════════════════════════════════════════════════\n"
+    )
+    log_entry = DispatchLog(
+        incident_ref=incident.ref,
+        tier=3,
+        action_taken="COMMUNITY BROADCAST SENT",
+        score_breakdown=json.dumps(
+            {"note": "public broadcast triggered", "score": incident.confidence_score}
+        ),
+        dispatched_at=datetime.utcnow(),
+    )
+    db.add(log_entry)
+    await db.flush()
+
+
 # ── DB session dependency ─────────────────────────────────────────────────────
 
 async def get_db():
@@ -298,6 +354,21 @@ class IncidentCreateRequest(BaseModel):
 class HighRiskAreasRequest(BaseModel):
     areas: list[str]
 
+
+class BroadcastRequest(BaseModel):
+    ref: str
+
+
+class OfficerActionRequest(BaseModel):
+    officer_id: str
+
+
+class DowngradeRequest(BaseModel):
+    officer_id: str
+    target_tier: int
+
+
+_TERMINAL_STATUSES = {"resolved", "false_alarm"}
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -431,9 +502,9 @@ async def active_alerts(db: AsyncSession = Depends(get_db)):
     return {"count": len(results), "alerts": [_incident_dict(i) for i in results]}
 
 
-# ── GET /incidents/confirm/<ref> ──────────────────────────────────────────────
+# ── PATCH /incidents/confirm/{ref} ───────────────────────────────────────────
 
-@app.get("/incidents/confirm/{ref}")
+@app.patch("/incidents/confirm/{ref}")
 async def confirm_incident(ref: str, db: AsyncSession = Depends(get_db)):
     incident = (
         await db.execute(select(Incident).where(Incident.ref == ref))
@@ -441,12 +512,21 @@ async def confirm_incident(ref: str, db: AsyncSession = Depends(get_db)):
 
     if not incident:
         raise HTTPException(status_code=404, detail=f"Incident '{ref}' not found")
+    if incident.status in _TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Incident '{ref}' is already {incident.status}")
 
+    old_tier = incident.tier
     incident.is_authority_confirmed = True
     await db.flush()
 
     breakdown = await compute_score(incident, db)
     action = await run_dispatch(incident, breakdown, db)
+
+    incident.status = "confirmed"  # officer physically confirmed on ground
+
+    if incident.tier == 3 and old_tier < 3:
+        await _broadcast_alert(incident, db)
+
     await db.commit()
     await db.refresh(incident)
 
@@ -454,6 +534,243 @@ async def confirm_incident(ref: str, db: AsyncSession = Depends(get_db)):
         **_incident_dict(incident),
         "score_breakdown": breakdown,
         "action_taken": action,
+    }
+
+
+# ── POST /alerts/broadcast ────────────────────────────────────────────────────
+
+@app.post("/alerts/broadcast")
+async def broadcast_alert(body: BroadcastRequest, db: AsyncSession = Depends(get_db)):
+    incident = (
+        await db.execute(select(Incident).where(Incident.ref == body.ref))
+    ).scalar_one_or_none()
+
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{body.ref}' not found")
+
+    if incident.tier < 3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Broadcast only allowed for Tier 3 incidents (current tier: {incident.tier})",
+        )
+
+    await _broadcast_alert(incident, db)
+    await db.commit()
+
+    return {
+        "ref": incident.ref,
+        "status": "broadcast_sent",
+        "message": f"Community notification dispatched for incident {incident.ref}",
+    }
+
+
+# ── GET /incidents/dashboard ──────────────────────────────────────────────────
+
+@app.get("/incidents/dashboard")
+async def dashboard(db: AsyncSession = Depends(get_db)):
+    incidents = (
+        await db.execute(
+            select(Incident).where(Incident.status.in_(["active", "pending", "confirmed"]))
+        )
+    ).scalars().all()
+
+    incidents_sorted = sorted(incidents, key=lambda i: i.confidence_score, reverse=True)
+
+    results = []
+    for inc in incidents_sorted:
+        latest_log = (
+            await db.execute(
+                select(DispatchLog)
+                .where(DispatchLog.incident_ref == inc.ref)
+                .order_by(DispatchLog.dispatched_at.desc())
+            )
+        ).scalars().first()
+
+        entry = _incident_dict(inc)
+        entry["score_breakdown"] = (
+            json.loads(latest_log.score_breakdown) if latest_log else {}
+        )
+        results.append(entry)
+
+    return {"count": len(results), "incidents": results}
+
+
+# ── PATCH /incidents/{ref}/resolve ───────────────────────────────────────────
+
+@app.patch("/incidents/{ref}/resolve")
+async def resolve_incident(ref: str, body: OfficerActionRequest, db: AsyncSession = Depends(get_db)):
+    incident = (
+        await db.execute(select(Incident).where(Incident.ref == ref))
+    ).scalar_one_or_none()
+
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{ref}' not found")
+    if incident.status in _TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Incident '{ref}' is already {incident.status}")
+
+    incident.status = "resolved"
+
+    log_entry = DispatchLog(
+        incident_ref=incident.ref,
+        tier=incident.tier,
+        action_taken=f"RESOLVED by officer {body.officer_id}. Incident cleared.",
+        score_breakdown=json.dumps({
+            "officer_id": body.officer_id,
+            "resolved_at": datetime.utcnow().isoformat(),
+            "final_score": incident.confidence_score,
+        }),
+        dispatched_at=datetime.utcnow(),
+    )
+    db.add(log_entry)
+
+    await db.commit()
+    await db.refresh(incident)
+
+    return {
+        **_incident_dict(incident),
+        "resolved_by": body.officer_id,
+        "resolved_at": log_entry.dispatched_at.isoformat(),
+    }
+
+
+# ── PATCH /incidents/{ref}/false-alarm ───────────────────────────────────────
+
+@app.patch("/incidents/{ref}/false-alarm")
+async def mark_false_alarm(ref: str, body: OfficerActionRequest, db: AsyncSession = Depends(get_db)):
+    incident = (
+        await db.execute(select(Incident).where(Incident.ref == ref))
+    ).scalar_one_or_none()
+
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{ref}' not found")
+    if incident.status in _TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Incident '{ref}' is already {incident.status}")
+
+    # Collect every reporter who corroborated within 60 min of the original report
+    window_start = incident.reported_at - timedelta(minutes=5)   # small backslide for clock skew
+    window_end = incident.reported_at + timedelta(minutes=60)
+    corroborators = (
+        await db.execute(
+            select(Incident).where(
+                Incident.ref != incident.ref,
+                Incident.incident_type == incident.incident_type,
+                Incident.reported_at >= window_start,
+                Incident.reported_at <= window_end,
+            )
+        )
+    ).scalars().all()
+
+    contributor_ids: set[str] = {
+        r.phone_or_user_id
+        for r in corroborators
+        if _geo_or_string_match(r, incident)
+    }
+    contributor_ids.add(incident.phone_or_user_id)
+
+    # Apply credibility penalty — farming false alarms becomes self-defeating
+    PENALTY = 0.3
+    FLOOR = 0.1
+    penalized = []
+
+    for uid in contributor_ids:
+        profile = (
+            await db.execute(
+                select(ReporterProfile).where(ReporterProfile.phone_or_user_id == uid)
+            )
+        ).scalar_one_or_none()
+
+        if profile is None:
+            profile = ReporterProfile(phone_or_user_id=uid)
+            db.add(profile)
+            await db.flush()
+
+        old_weight = profile.credibility_weight
+        profile.credibility_weight = round(max(FLOOR, old_weight - PENALTY), 3)
+        profile.false_alarm_count += 1
+        profile.last_penalized_at = datetime.utcnow()
+        penalized.append({
+            "phone_or_user_id": uid,
+            "old_weight": old_weight,
+            "new_weight": profile.credibility_weight,
+            "false_alarm_count": profile.false_alarm_count,
+        })
+
+    incident.status = "false_alarm"
+
+    log_entry = DispatchLog(
+        incident_ref=incident.ref,
+        tier=incident.tier,
+        action_taken=(
+            f"FALSE ALARM — confirmed by officer {body.officer_id}. "
+            f"Credibility penalty applied to {len(contributor_ids)} reporter(s)."
+        ),
+        score_breakdown=json.dumps({
+            "officer_id": body.officer_id,
+            "penalized_reporters": penalized,
+        }),
+        dispatched_at=datetime.utcnow(),
+    )
+    db.add(log_entry)
+
+    await db.commit()
+    await db.refresh(incident)
+
+    return {
+        **_incident_dict(incident),
+        "penalized_reporters": penalized,
+        "action_taken": log_entry.action_taken,
+    }
+
+
+# ── PATCH /incidents/{ref}/downgrade ─────────────────────────────────────────
+
+@app.patch("/incidents/{ref}/downgrade")
+async def downgrade_incident(ref: str, body: DowngradeRequest, db: AsyncSession = Depends(get_db)):
+    incident = (
+        await db.execute(select(Incident).where(Incident.ref == ref))
+    ).scalar_one_or_none()
+
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{ref}' not found")
+    if incident.status in _TERMINAL_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Incident '{ref}' is already {incident.status}")
+    if body.target_tier >= incident.tier:
+        raise HTTPException(
+            status_code=400,
+            detail=f"target_tier ({body.target_tier}) must be lower than current tier ({incident.tier})",
+        )
+    if body.target_tier < 1:
+        raise HTTPException(status_code=400, detail="target_tier must be >= 1")
+
+    old_tier = incident.tier
+    incident.tier = body.target_tier
+
+    log_entry = DispatchLog(
+        incident_ref=incident.ref,
+        tier=body.target_tier,
+        action_taken=(
+            f"DOWNGRADED Tier {old_tier} → Tier {body.target_tier} "
+            f"by officer {body.officer_id}. "
+            f"{TIER_LABELS.get(body.target_tier, 'Unknown')}."
+        ),
+        score_breakdown=json.dumps({
+            "officer_id": body.officer_id,
+            "previous_tier": old_tier,
+            "new_tier": body.target_tier,
+            "score_at_downgrade": incident.confidence_score,
+        }),
+        dispatched_at=datetime.utcnow(),
+    )
+    db.add(log_entry)
+
+    await db.commit()
+    await db.refresh(incident)
+
+    return {
+        **_incident_dict(incident),
+        "previous_tier": old_tier,
+        "downgraded_by": body.officer_id,
+        "action_taken": log_entry.action_taken,
     }
 
 
